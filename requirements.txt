@@ -1,0 +1,6 @@
+streamlit
+requests
+urllib3
+pandas
+yfinance
+mplfinance
