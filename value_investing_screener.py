@@ -17,19 +17,11 @@ import json
 st.set_page_config(page_title="台股價值選股儀表板", page_icon="📈", layout="wide")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- 防阻擋機制：建立專屬的偽裝 Session ---
-@st.cache_resource
-def get_yf_session():
-    """建立帶有真實瀏覽器 User-Agent 的請求 Session，避免被 Yahoo 阻擋"""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    })
-    return session
-
 # --- 資料抓取與輔助區塊 ---
+
 @st.cache_data(ttl=3600)
 def get_twse_stock_data():
+    """從台灣證券交易所抓取基本面數據"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     for i in range(10):
         target_date = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
@@ -60,7 +52,7 @@ def get_twse_company_profile():
 @st.cache_data(ttl=86400)
 def get_company_business_summary_zh(stock_id):
     url = f"https://tw.stock.yahoo.com/quote/{stock_id}/profile"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         res = requests.get(url, headers=headers, timeout=5)
         match = re.search(r'"businessSummary":"((?:[^"\\]|\\.)*)"', res.text)
@@ -88,7 +80,7 @@ def get_google_news(stock_id, stock_name):
     query = f"{stock_id} {stock_name}"
     url = f"https://news.google.com/rss/search?q={query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     news_list = []
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         response = requests.get(url, headers=headers, verify=False, timeout=10)
         if response.status_code == 200:
@@ -109,6 +101,7 @@ def get_google_news(stock_id, stock_name):
     return news_list
 
 # --- 數據處理區塊 (基本面 + 技術面) ---
+
 def clean_and_filter_data(df, max_pe, min_yield, max_pb):
     if df is None or df.empty: return None
     target_columns = {'證券代號': '代號', '證券名稱': '名稱', '本益比': '本益比', '殖利率(%)': '殖利率(%)', '股價淨值比': '股價淨值比'}
@@ -128,19 +121,19 @@ def clean_and_filter_data(df, max_pe, min_yield, max_pb):
 
 @st.cache_data(ttl=300)
 def apply_technical_filters(df, req_20ma, req_5d_high, req_macd, req_rsi):
+    """執行技術分析運算"""
     if df is None or df.empty: return df
     
     stock_ids = df['代號'].tolist()
-    if len(stock_ids) > 100:
-        st.warning("⚠️ 為了避免被 Yahoo 封鎖，雲端版本單次技術分析限制最多 100 檔。請在左側放寬基本面條件！")
-        stock_ids = stock_ids[:100]
-        df = df.head(100)
+    if len(stock_ids) > 200:
+        st.warning("⚠️ 符合基本面的股票過多。為維持連線速度，技術分析僅取前 200 檔進行運算。建議縮緊基本面條件！")
+        stock_ids = stock_ids[:200]
+        df = df.head(200)
 
     tickers = [f"{sid}.TW" for sid in stock_ids]
     try:
-        # 套用自訂的 Session 來繞過防護
-        yf_session = get_yf_session()
-        data = yf.download(tickers, period="3mo", progress=False, group_by="ticker", session=yf_session)
+        # 批次下載歷史股價，group_by="ticker" 可確保資料結構穩定
+        data = yf.download(tickers, period="3mo", progress=False, group_by="ticker")
     except Exception as e:
         st.error(f"下載技術線圖資料時發生錯誤: {e}")
         return df
@@ -153,6 +146,7 @@ def apply_technical_filters(df, req_20ma, req_5d_high, req_macd, req_rsi):
     for sid in stock_ids:
         ticker = f"{sid}.TW"
         try:
+            # 提取單一股票的收盤價與最高價
             if is_multi:
                 if ticker not in data.columns.levels[0]: continue
                 s_close = data[ticker]['Close'].dropna()
@@ -161,54 +155,60 @@ def apply_technical_filters(df, req_20ma, req_5d_high, req_macd, req_rsi):
                 s_close = data['Close'].dropna()
                 s_high = data['High'].dropna()
 
-            if len(s_close) < 30: continue
+            if len(s_close) < 30: # 資料太少無法算月線
+                continue
 
             latest_close = s_close.iloc[-1]
             pass_all = True
 
+            # 1. 月線 (20MA) 條件
             if req_20ma:
                 ma20 = s_close.rolling(20).mean().iloc[-1]
-                if latest_close < ma20: pass_all = False
+                if latest_close < ma20:
+                    pass_all = False
 
+            # 2. 創 5 日新高條件
             if pass_all and req_5d_high:
                 recent_5d_high = s_high.iloc[-5:].max()
-                if latest_close < recent_5d_high: pass_all = False
+                if latest_close < recent_5d_high:
+                    pass_all = False
 
+            # 3. MACD 多頭條件 (柱狀圖 > 0)
             if pass_all and req_macd:
                 ema12 = s_close.ewm(span=12, adjust=False).mean()
                 ema26 = s_close.ewm(span=26, adjust=False).mean()
                 macd = ema12 - ema26
                 signal = macd.ewm(span=9, adjust=False).mean()
                 hist = macd - signal
-                if hist.iloc[-1] <= 0: pass_all = False
+                if hist.iloc[-1] <= 0:
+                    pass_all = False
 
+            # 4. RSI(14) 強勢條件 (> 50)
             if pass_all and req_rsi:
                 delta = s_close.diff()
                 gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
                 loss = -1 * delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean()
                 rs = gain / loss
                 rsi = 100 - (100 / (1 + rs))
-                if rsi.iloc[-1] <= 50: pass_all = False
+                if rsi.iloc[-1] <= 50:
+                    pass_all = False
 
-            if pass_all: passed_stocks.append(sid)
+            if pass_all:
+                passed_stocks.append(sid)
+
         except Exception:
             continue
 
     return df[df['代號'].isin(passed_stocks)]
 
-@st.cache_data(ttl=600)
-def get_stock_history_cached(ticker):
-    """加入快取機制，避免重複點擊同一檔股票時不斷向 Yahoo 要資料"""
-    yf_session = get_yf_session()
-    stock = yf.Ticker(ticker, session=yf_session)
-    return stock.history(period="6mo")
-
 # ==========================================
 # 網頁介面 (UI) 設計區塊
 # ==========================================
+
 st.title("📈 台股價值選股與深度分析系統")
 st.markdown(f"資料更新時間：**{datetime.now().strftime('%Y-%m-%d')}** (資料來源：台灣證券交易所)")
 
+# --- 側邊欄設定 ---
 st.sidebar.header("⚙️ 1. 基本面條件 (尋找好公司)")
 max_pe = st.sidebar.slider("本益比 (P/E) 最大值", min_value=5.0, max_value=30.0, value=15.0, step=0.5)
 min_yield = st.sidebar.slider("殖利率 (%) 最小值", min_value=0.0, max_value=15.0, value=4.0, step=0.5)
@@ -236,8 +236,10 @@ with col1:
     selected_stock_name = ""
     
     if raw_data is not None:
+        # 第一層篩選：基本面
         result_df = clean_and_filter_data(raw_data, max_pe, min_yield, max_pb)
         
+        # 第二層篩選：技術面 (如果有勾選任何一項)
         if result_df is not None and not result_df.empty:
             if any([tech_20ma, tech_5d_high, tech_macd, tech_rsi]):
                 with st.spinner('正在分析歷史線圖與技術指標 (MACD/RSI/MA)...'):
@@ -247,8 +249,12 @@ with col1:
             st.success(f"篩選完成！共找到 **{len(result_df)}** 檔股票符合條件。")
             
             selection_event = st.dataframe(
-                result_df, use_container_width=True, hide_index=True, height=600,
-                on_select="rerun", selection_mode="single-row"
+                result_df,
+                use_container_width=True,
+                hide_index=True,
+                height=600,
+                on_select="rerun",
+                selection_mode="single-row"
             )
             
             if len(selection_event.selection.rows) > 0:
@@ -269,11 +275,11 @@ with col2:
         with st.spinner(f"正在抓取 {stock_id} 的各項數據與中文新聞..."):
             try:
                 ticker = f"{stock_id}.TW"
-                # 改用有快取與偽裝機制的資料抓取函數
-                df = get_stock_history_cached(ticker)
+                stock = yf.Ticker(ticker)
+                df = stock.history(period="6mo")
                 
                 if df.empty:
-                    st.error(f"❌ 找不到代號 {stock_id} 的歷史資料。可能是 Yahoo 伺服器暫時阻擋，請稍後再試。")
+                    st.error(f"❌ 找不到代號 {stock_id} 的歷史資料。")
                 else:
                     ohlcv_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
                     df = df.dropna(subset=ohlcv_cols)
@@ -299,8 +305,6 @@ with col2:
                         summary_zh = get_company_business_summary_zh(stock_id)
                         
                         if not summary_zh:
-                            yf_session = get_yf_session()
-                            stock = yf.Ticker(ticker, session=yf_session)
                             info = stock.info
                             english_summary = info.get('longBusinessSummary', '目前無此公司的詳細業務資料。')
                             if english_summary != '目前無此公司的詳細業務資料。':
