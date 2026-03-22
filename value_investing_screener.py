@@ -1,5 +1,5 @@
 # ==========================================
-# 版本：v1.5
+# 版本：v1.6
 # 日期：2026-03-22
 # ==========================================
 import streamlit as st
@@ -182,11 +182,16 @@ def apply_technical_filters(df, req_20ma, req_5d_high, req_macd, req_rsi):
             if req_20ma:
                 ma20 = s_close.rolling(20).mean().iloc[-1]
                 if latest_close < ma20: pass_all = False
+                
             if pass_all and req_5d_high:
-                if latest_close < s_high.iloc[-5:].max(): pass_all = False
+                # [v1.6 修正]：比較「今日收盤價」與「過去 5 日的最高收盤價」
+                # 解決如果今天留有上影線，就會被判定為沒有創高的錯誤邏輯
+                if latest_close < s_close.iloc[-5:].max(): pass_all = False
+                
             if pass_all and req_macd:
                 macd = s_close.ewm(span=12, adjust=False).mean() - s_close.ewm(span=26, adjust=False).mean()
                 if (macd - macd.ewm(span=9, adjust=False).mean()).iloc[-1] <= 0: pass_all = False
+                
             if pass_all and req_rsi:
                 delta = s_close.diff()
                 rs = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean() / (-1 * delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean())
@@ -298,7 +303,7 @@ def display_stock_analysis(stock_id, selected_stock_name, company_profile_df):
 # 網頁主架構與導覽
 # ==========================================
 st.title("📈 台股全方位選股與深度分析系統")
-st.markdown(f"**系統版本：v1.5 (2026-03-22)** | 資料更新時間：**{datetime.now().strftime('%Y-%m-%d')}** (資料來源：台灣證券交易所)")
+st.markdown(f"**系統版本：v1.6 (2026-03-22)** | 資料更新時間：**{datetime.now().strftime('%Y-%m-%d')}** (資料來源：台灣證券交易所)")
 
 # 側邊欄：全域導覽列
 st.sidebar.title("🧭 系統導覽")
