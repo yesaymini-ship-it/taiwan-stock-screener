@@ -1,248 +1,452 @@
-<!-- ========================================== -->
-<!-- 最後修改時間：2026-03-22 10:40 -->
-<!-- ========================================== -->
-<!DOCTYPE html>
-<html lang="zh-TW">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>我的專屬選股儀表板</title>
-    <!-- 引入 Tailwind CSS 進行快速網頁排版與美化 -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- 引入 FontAwesome 圖示 -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        /* 簡單的自訂動畫與捲軸美化 */
-        body { background-color: #f3f4f6; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        .fade-in { animation: fadeIn 0.5s ease-in-out; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #f1f1f1; }
-        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
-    </style>
-</head>
-<body class="text-gray-800">
+# ==========================================
+# 版本：v1.5
+# 日期：2026-03-22
+# ==========================================
+import streamlit as st
+import requests
+import urllib3
+import pandas as pd
+import yfinance as yf
+import mplfinance as mpf
+from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+import re
+import json
 
-    <div class="max-w-6xl mx-auto p-4 sm:p-6 lg:p-8">
-        <!-- 頁首區塊 -->
-        <header class="flex items-center justify-between mb-8 pb-4 border-b border-gray-200 fade-in">
-            <div>
-                <h1 class="text-3xl font-bold text-indigo-700 flex items-center gap-2">
-                    <i class="fa-solid fa-chart-line"></i> 價值投資選股系統
-                </h1>
-                <p class="text-gray-500 mt-1">自訂策略篩選，找出被低估的優質好股</p>
-            </div>
-            <div class="hidden sm:block text-sm text-gray-400">
-                <p>最後更新時間：2026-03-22 10:40</p>
-                <p>資料來源：模擬台股盤後數據</p>
-            </div>
-        </header>
+st.set_page_config(page_title="台股價值選股儀表板", page_icon="📈", layout="wide")
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+# --- 系統記憶體初始化 (Session State) ---
+# 用來記錄使用者點擊收藏的「自選股清單」
+if 'watchlist' not in st.session_state:
+    st.session_state['watchlist'] = []
+
+# 統一使用現代瀏覽器的 User-Agent，避免被當成機器人
+CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+
+# --- 建立 主題/產業 供應鏈資料庫 ---
+THEME_CONCEPTS = {
+    "矽智財與IC設計 (ASIC)": ['3661', '3443', '3035', '6643'],
+    "晶圓代工與先進封裝": ['2330', '3711', '2449'],
+    "CoWoS 設備": ['3583', '3131', '6187'],
+    "散熱模組 (3D VC/水冷)": ['3017', '3324', '2421', '8996'],
+    "銅箔基板 (CCL)": ['2383', '6274', '6213'],
+    "印刷電路板 (PCB)": ['2368', '3037', '3044'],
+    "電源供應器": ['2308', '2301', '6412'],
+    "伺服器滑軌": ['2059', '6584'],
+    "伺服器機殼": ['8210', '6117', '3013'],
+    "伺服器組裝代工 (ODM)": ['2382', '3231', '6669', '2376', '2317', '2356'],
+    "矽光子與CPO": ['3081', '3363', '3163', '6442'],
+    "🚀 低軌衛星與網通 (LEO)": ['3491', '6285', '2314', '5388', '3380', '3062']
+}
+
+# --- 資料抓取與輔助區塊 ---
+@st.cache_data(ttl=3600)
+def get_twse_stock_data():
+    headers = {'User-Agent': CHROME_UA}
+    for i in range(10):
+        target_date = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
+        url = f"https://www.twse.com.tw/exchangeReport/BWIBBU_d?response=json&date={target_date}"
+        try:
+            response = requests.get(url, headers=headers, verify=False, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data['stat'] == 'OK':
+                    df = pd.DataFrame(data['data'], columns=data['fields'])
+                    return df
+        except Exception:
+            pass
+    st.error("連續 10 天都找不到交易資料，可能是證交所網站維護中。")
+    return None
+
+@st.cache_data(ttl=86400)
+def get_twse_company_profile():
+    url = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+    try:
+        response = requests.get(url, verify=False, timeout=10)
+        if response.status_code == 200:
+            return pd.DataFrame(response.json())
+    except Exception as e:
+        pass
+    return pd.DataFrame()
+
+@st.cache_data(ttl=86400)
+def get_company_business_summary_zh(stock_id):
+    url = f"https://tw.stock.yahoo.com/quote/{stock_id}/profile"
+    headers = {'User-Agent': CHROME_UA}
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        match = re.search(r'"businessSummary":"((?:[^"\\]|\\.)*)"', res.text)
+        if match:
+            return json.loads(f'"{match.group(1)}"')
+    except Exception:
+        pass
+    return None
+
+def translate_to_zh_tw(text):
+    if not text or text == '目前無此公司的詳細業務資料。': return text
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {"client": "gtx", "sl": "auto", "tl": "zh-TW", "dt": "t", "q": text}
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        if response.status_code == 200:
+            result = response.json()
+            return "".join([sentence[0] for sentence in result[0] if sentence[0]])
+    except Exception:
+        pass
+    return text
+
+def get_google_news(stock_id, stock_name):
+    query = f"{stock_id} {stock_name}"
+    url = f"https://news.google.com/rss/search?q={query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    news_list = []
+    headers = {'User-Agent': CHROME_UA}
+    try:
+        response = requests.get(url, headers=headers, verify=False, timeout=10)
+        if response.status_code == 200:
+            root = ET.fromstring(response.text)
+            for item in root.findall('.//channel/item')[:5]:
+                title = item.find('title').text
+                link = item.find('link').text
+                pub_date_str = item.find('pubDate').text
+                try:
+                    dt = parsedate_to_datetime(pub_date_str)
+                    dt_tw = dt + timedelta(hours=8)
+                    formatted_date = dt_tw.strftime('%Y-%m-%d %H:%M')
+                except:
+                    formatted_date = pub_date_str
+                news_list.append({"title": title, "link": link, "date": formatted_date})
+    except Exception:
+        pass
+    return news_list
+
+# --- 數據處理區塊 (基本面 + 技術面) ---
+def clean_and_filter_data(df, max_pe, min_yield, max_pb, ignore_fundamentals=False):
+    if df is None or df.empty: return None
+    target_columns = {'證券代號': '代號', '證券名稱': '名稱', '本益比': '本益比', '殖利率(%)': '殖利率(%)', '股價淨值比': '股價淨值比'}
+    try:
+        clean_df = df[list(target_columns.keys())].rename(columns=target_columns)
+    except KeyError:
+        return None
+        
+    for col in ['本益比', '殖利率(%)', '股價淨值比']:
+        clean_df[col] = clean_df[col].replace('-', '0').str.replace(',', '').astype(float)
+        
+    if ignore_fundamentals:
+        return clean_df.sort_values(by='代號')
+        
+    condition1 = (clean_df['本益比'] > 0) & (clean_df['本益比'] <= max_pe)
+    condition2 = (clean_df['殖利率(%)'] >= min_yield)
+    condition3 = (clean_df['股價淨值比'] <= max_pb)
+    
+    return clean_df[condition1 & condition2 & condition3].sort_values(by='殖利率(%)', ascending=False)
+
+@st.cache_data(ttl=300)
+def apply_technical_filters(df, req_20ma, req_5d_high, req_macd, req_rsi):
+    if df is None or df.empty: return df
+    
+    stock_ids = df['代號'].tolist()
+    if len(stock_ids) > 50:
+        st.warning("⚠️ 技術分析單次最高限制 50 檔進行運算。目前僅分析前 50 檔。")
+        stock_ids = stock_ids[:50]
+        df = df.head(50)
+
+    tickers = [f"{sid}.TW" for sid in stock_ids]
+    try:
+        data = yf.download(tickers, period="3mo", progress=False, group_by="ticker")
+    except Exception as e:
+        return df
+
+    if data.empty: return pd.DataFrame()
+
+    passed_stocks = []
+    is_multi = isinstance(data.columns, pd.MultiIndex)
+
+    for sid in stock_ids:
+        ticker = f"{sid}.TW"
+        try:
+            if is_multi:
+                if ticker not in data.columns.levels[0]: continue
+                s_close = data[ticker]['Close'].dropna()
+                s_high = data[ticker]['High'].dropna()
+            else:
+                s_close = data['Close'].dropna()
+                s_high = data['High'].dropna()
+
+            if len(s_close) < 30: continue
+
+            latest_close = s_close.iloc[-1]
+            pass_all = True
+
+            if req_20ma:
+                ma20 = s_close.rolling(20).mean().iloc[-1]
+                if latest_close < ma20: pass_all = False
+            if pass_all and req_5d_high:
+                if latest_close < s_high.iloc[-5:].max(): pass_all = False
+            if pass_all and req_macd:
+                macd = s_close.ewm(span=12, adjust=False).mean() - s_close.ewm(span=26, adjust=False).mean()
+                if (macd - macd.ewm(span=9, adjust=False).mean()).iloc[-1] <= 0: pass_all = False
+            if pass_all and req_rsi:
+                delta = s_close.diff()
+                rs = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean() / (-1 * delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean())
+                if (100 - (100 / (1 + rs))).iloc[-1] <= 50: pass_all = False
+
+            if pass_all: passed_stocks.append(sid)
+        except Exception:
+            continue
+    return df[df['代號'].isin(passed_stocks)]
+
+@st.cache_data(ttl=600)
+def get_stock_history_cached(ticker):
+    stock = yf.Ticker(ticker)
+    return stock.history(period="6mo")
+
+# --- 模組化：個股深度分析區塊 ---
+def display_stock_analysis(stock_id, selected_stock_name, company_profile_df):
+    """將畫 K 線圖與資訊頁籤封裝成函數，讓選股雷達與自選股頁面共用"""
+    ticker = f"{stock_id}.TW"
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 K線圖", "🏢 核心業務", "📰 近期新聞", "💡 投資建議"])
+    global_df = pd.DataFrame() 
+
+    with tab1:
+        with st.spinner(f"正在抓取 {stock_id} 歷史股價..."):
+            try:
+                df = get_stock_history_cached(ticker)
+                global_df = df 
+                
+                if df.empty:
+                    st.warning(f"❌ 找不到代號 {stock_id} 的歷史資料，或遭 Yahoo 暫時阻擋。")
+                else:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.droplevel(1)
+                        
+                    ohlcv_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+                    df_chart = df.dropna(subset=ohlcv_cols)
+                    df_chart[ohlcv_cols] = df_chart[ohlcv_cols].astype(float)
+                    
+                    fig, axlist = mpf.plot(
+                        df_chart, type='candle', volume=True, style='yahoo',
+                        title=f"{stock_id} K-Line (6 Months)",
+                        ylabel='Price', ylabel_lower='Volume',
+                        returnfig=True, figsize=(8, 4)
+                    )
+                    st.pyplot(fig)
+            except Exception as e:
+                st.error(f"K線圖繪製失敗。錯誤訊息: {e}")
+                
+    with tab2:
+        with st.spinner("正在抓取公司資料..."):
+            industry = "無提供分類"
+            if not company_profile_df.empty:
+                company_info = company_profile_df[company_profile_df['公司代號'] == stock_id]
+                if not company_info.empty:
+                    industry = company_info.iloc[0].get('產業類別', '無提供分類')
+                    
+            summary_zh = get_company_business_summary_zh(stock_id)
+            if not summary_zh:
+                try:
+                    english_summary = yf.Ticker(ticker).info.get('longBusinessSummary', '目前無此公司的詳細業務資料。')
+                    if english_summary != '目前無此公司的詳細業務資料。':
+                        translated_summary = translate_to_zh_tw(english_summary)
+                        summary_zh = f"*(🤖 已自動由英文翻譯為中文)*\n\n{translated_summary}"
+                    else:
+                        summary_zh = english_summary
+                except:
+                    summary_zh = "無法取得公司簡介"
             
-            <!-- 左側：篩選條件控制面板 -->
-            <div class="lg:col-span-1 bg-white rounded-xl shadow-sm border border-gray-100 p-5 fade-in">
-                <h2 class="text-lg font-semibold mb-4 border-b pb-2"><i class="fa-solid fa-filter text-indigo-500"></i> 設定篩選條件</h2>
-                
-                <div class="space-y-5">
-                    <!-- 條件 1：本益比 -->
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-1">本益比 (P/E) 低於</label>
-                        <div class="flex items-center gap-2">
-                            <input type="range" id="peRange" min="5" max="30" value="15" class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer" oninput="document.getElementById('peValue').innerText = this.value">
-                            <span id="peValue" class="text-sm font-bold w-8 text-right text-indigo-600">15</span>
-                        </div>
-                        <p class="text-xs text-gray-400 mt-1">尋找價格相對便宜的股票</p>
-                    </div>
-
-                    <!-- 條件 2：殖利率 -->
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-1">現金殖利率 高於 (%)</label>
-                        <div class="flex items-center gap-2">
-                            <input type="range" id="yieldRange" min="0" max="10" step="0.5" value="4.0" class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer" oninput="document.getElementById('yieldValue').innerText = this.value">
-                            <span id="yieldValue" class="text-sm font-bold w-8 text-right text-indigo-600">4.0</span>
-                        </div>
-                        <p class="text-xs text-gray-400 mt-1">確保每年有穩定的股息收入</p>
-                    </div>
-
-                    <!-- 條件 3：EPS成長 -->
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">基本面指標</label>
-                        <label class="flex items-center space-x-2 cursor-pointer">
-                            <input type="checkbox" id="epsGrowth" checked class="rounded text-indigo-600 focus:ring-indigo-500">
-                            <span class="text-sm text-gray-700">近四季 EPS 大於去年同期</span>
-                        </label>
-                    </div>
-
-                    <button onclick="runFilter()" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition-colors duration-200 shadow-sm flex justify-center items-center gap-2 mt-4">
-                        <i class="fa-solid fa-play"></i> 執行策略選股
-                    </button>
-                </div>
-            </div>
-
-            <!-- 右側：選股結果呈現區塊 -->
-            <div class="lg:col-span-3 bg-white rounded-xl shadow-sm border border-gray-100 p-5 fade-in" style="animation-delay: 0.1s;">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-lg font-semibold"><i class="fa-solid fa-list-check text-green-500"></i> 符合條件的股票清單</h2>
-                    <span id="resultCount" class="bg-green-100 text-green-800 text-xs font-medium px-2.5 py-0.5 rounded-full">共 0 檔</span>
-                </div>
-
-                <!-- 模擬資料載入中的動畫 -->
-                <div id="loading" class="hidden flex-col items-center justify-center py-12">
-                    <i class="fa-solid fa-circle-notch fa-spin text-3xl text-indigo-500 mb-3"></i>
-                    <p class="text-gray-500">系統正在掃描全市場數據...</p>
-                </div>
-
-                <!-- 股票表格 -->
-                <div id="tableContainer" class="overflow-x-auto">
-                    <table class="min-w-full divide-y divide-gray-200">
-                        <thead class="bg-gray-50">
-                            <tr>
-                                <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">代號/名稱</th>
-                                <th scope="col" class="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">收盤價</th>
-                                <th scope="col" class="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">本益比 (P/E)</th>
-                                <th scope="col" class="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">殖利率</th>
-                                <th scope="col" class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">EPS成長</th>
-                                <th scope="col" class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="stockTableBody" class="bg-white divide-y divide-gray-200">
-                            <!-- JS 動態產生資料 -->
-                        </tbody>
-                    </table>
-                </div>
-                
-                <!-- 無結果提示 -->
-                <div id="noDataMsg" class="hidden text-center py-10 text-gray-500">
-                    <i class="fa-regular fa-folder-open text-4xl mb-2 text-gray-300"></i>
-                    <p>目前沒有符合條件的股票，請嘗試放寬篩選標準。</p>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- 顯示訊息的輕量化提示框 -->
-    <div id="toast" class="fixed bottom-5 right-5 bg-gray-800 text-white px-4 py-2 rounded shadow-lg transform translate-y-20 opacity-0 transition-all duration-300">
-        已複製代號！
-    </div>
-
-    <script>
-        // 模擬台股資料庫 (在真實開發中，這些資料會透過 Python 爬蟲或 API 取得)
-        const mockDatabase = [
-            { id: '2330', name: '台積電', price: 780.0, pe: 18.5, yield: 2.1, epsGrowth: true },
-            { id: '2317', name: '鴻海', price: 145.5, pe: 12.8, yield: 4.5, epsGrowth: true },
-            { id: '2454', name: '聯發科', price: 1050.0, pe: 16.2, yield: 5.2, epsGrowth: false },
-            { id: '2881', name: '富邦金', price: 68.2, pe: 10.5, yield: 5.8, epsGrowth: true },
-            { id: '2882', name: '國泰金', price: 48.5, pe: 9.8, yield: 4.9, epsGrowth: true },
-            { id: '1101', name: '台泥', price: 32.1, pe: 14.2, yield: 6.5, epsGrowth: false },
-            { id: '2002', name: '中鋼', price: 24.5, pe: 22.1, yield: 3.2, epsGrowth: false },
-            { id: '3231', name: '緯創', price: 115.0, pe: 14.5, yield: 3.8, epsGrowth: true },
-            { id: '2308', name: '台達電', price: 340.5, pe: 20.1, yield: 3.0, epsGrowth: true },
-            { id: '2891', name: '中信金', price: 31.8, pe: 11.2, yield: 6.1, epsGrowth: true }
-        ];
-
-        // 執行篩選的核心邏輯
-        function runFilter() {
-            // 取得使用者設定的條件
-            const maxPe = parseFloat(document.getElementById('peRange').value);
-            const minYield = parseFloat(document.getElementById('yieldRange').value);
-            const requireEpsGrowth = document.getElementById('epsGrowth').checked;
-
-            // UI 狀態切換：顯示載入中
-            document.getElementById('tableContainer').classList.add('hidden');
-            document.getElementById('noDataMsg').classList.add('hidden');
-            document.getElementById('loading').classList.remove('hidden');
-            document.getElementById('resultCount').innerText = '計算中...';
-
-            // 模擬程式運算延遲 (0.8秒)
-            setTimeout(() => {
-                // 核心過濾器：將陣列中不符合條件的股票剔除
-                const filteredStocks = mockDatabase.filter(stock => {
-                    let passPE = stock.pe <= maxPe;
-                    let passYield = stock.yield >= minYield;
-                    let passEPS = requireEpsGrowth ? stock.epsGrowth === true : true;
-                    return passPE && passYield && passEPS;
-                });
-
-                renderTable(filteredStocks);
-                
-                // UI 狀態切換：顯示結果
-                document.getElementById('loading').classList.add('hidden');
-                
-                if(filteredStocks.length > 0) {
-                    document.getElementById('tableContainer').classList.remove('hidden');
-                } else {
-                    document.getElementById('noDataMsg').classList.remove('hidden');
-                }
-                
-                document.getElementById('resultCount').innerText = `共 ${filteredStocks.length} 檔`;
-            }, 800);
-        }
-
-        // 將資料渲染成 HTML 表格
-        function renderTable(stocks) {
-            const tbody = document.getElementById('stockTableBody');
-            tbody.innerHTML = ''; // 清空現有資料
-
-            stocks.forEach((stock, index) => {
-                // 決定 EPS 成長的圖示顏色
-                const epsIcon = stock.epsGrowth 
-                    ? '<i class="fa-solid fa-check text-green-500"></i>' 
-                    : '<i class="fa-solid fa-xmark text-red-500"></i>';
-
-                const row = `
-                    <tr class="hover:bg-gray-50 transition-colors fade-in" style="animation-delay: ${index * 0.05}s">
-                        <td class="px-4 py-4 whitespace-nowrap">
-                            <div class="flex items-center">
-                                <div class="text-sm font-bold text-gray-900">${stock.id}</div>
-                                <div class="ml-2 text-sm text-gray-500">${stock.name}</div>
-                            </div>
-                        </td>
-                        <td class="px-4 py-4 whitespace-nowrap text-right text-sm font-medium text-gray-900">
-                            ${stock.price.toFixed(1)}
-                        </td>
-                        <td class="px-4 py-4 whitespace-nowrap text-right text-sm ${stock.pe < 12 ? 'text-green-600 font-bold' : 'text-gray-500'}">
-                            ${stock.pe.toFixed(1)}
-                        </td>
-                        <td class="px-4 py-4 whitespace-nowrap text-right text-sm ${stock.yield > 5 ? 'text-red-500 font-bold' : 'text-gray-500'}">
-                            ${stock.yield.toFixed(1)}%
-                        </td>
-                        <td class="px-4 py-4 whitespace-nowrap text-center text-sm">
-                            ${epsIcon}
-                        </td>
-                        <td class="px-4 py-4 whitespace-nowrap text-center text-sm font-medium">
-                            <button onclick="copyToClipboard('${stock.id}')" class="text-indigo-600 hover:text-indigo-900 bg-indigo-50 hover:bg-indigo-100 px-3 py-1 rounded-md transition-colors">
-                                <i class="fa-regular fa-copy"></i> 代號
-                            </button>
-                        </td>
-                    </tr>
-                `;
-                tbody.insertAdjacentHTML('beforeend', row);
-            });
-        }
-
-        // 輔助功能：複製代號
-        function copyToClipboard(text) {
-            const tempInput = document.createElement("input");
-            tempInput.value = text;
-            document.body.appendChild(tempInput);
-            tempInput.select();
-            document.execCommand("copy");
-            document.body.removeChild(tempInput);
+            st.markdown(f"**產業類別：** {industry}")
+            st.markdown("**主要經營業務：**")
+            st.info(summary_zh)
             
-            // 顯示提示
-            const toast = document.getElementById('toast');
-            toast.innerText = `已複製 ${text}`;
-            toast.classList.remove('translate-y-20', 'opacity-0');
+    with tab3:
+        with st.spinner("正在抓取近期新聞..."):
+            news = get_google_news(stock_id, selected_stock_name)
+            if news and len(news) > 0:
+                for n in news:
+                    st.markdown(f"- **[{n['date']}]** [{n['title']}]({n['link']})")
+            else:
+                st.write("目前沒有找到近期的相關新聞。")
             
-            setTimeout(() => {
-                toast.classList.add('translate-y-20', 'opacity-0');
-            }, 2000);
-        }
+    with tab4:
+        if not global_df.empty and len(global_df) >= 20:
+            close_price = global_df['Close'].iloc[-1]
+            ma20 = global_df['Close'].rolling(window=20).mean().iloc[-1]
+            half_year_ago_price = global_df['Close'].iloc[0]
+            return_rate = ((close_price - half_year_ago_price) / half_year_ago_price) * 100
+            
+            if isinstance(close_price, pd.Series): close_price = close_price.iloc[0]
+            if isinstance(ma20, pd.Series): ma20 = ma20.iloc[0]
+            if isinstance(return_rate, pd.Series): return_rate = return_rate.iloc[0]
+            
+            st.markdown("### 程式量化判斷與簡易回測")
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("最新收盤價", f"{float(close_price):.2f} 元")
+            col_b.metric("20日均線(月線)", f"{float(ma20):.2f} 元")
+            col_c.metric("過去半年持有績效", f"{float(return_rate):.2f}%", f"{float(return_rate):.2f}%")
+            
+            st.markdown("---")
+            if close_price > ma20:
+                st.success("🟢 **策略判定：建議可分批佈局 (偏多)**\n\n此股票目前股價站上月線，代表短期趨勢偏向多方。")
+            else:
+                st.warning("🟡 **策略判定：建議觀望，等待買點 (整理中)**\n\n目前股價跌破月線，顯示短期資金正在撤出或處於弱勢整理。")
+        else:
+            st.warning("⚠️ 歷史股價資料不足或載入失敗，無法計算技術指標投資建議。")
 
-        // 頁面載入時，預先執行一次篩選
-        window.onload = runFilter;
-    </script>
-</body>
-</html>
+
+# ==========================================
+# 網頁主架構與導覽
+# ==========================================
+st.title("📈 台股全方位選股與深度分析系統")
+st.markdown(f"**系統版本：v1.5 (2026-03-22)** | 資料更新時間：**{datetime.now().strftime('%Y-%m-%d')}** (資料來源：台灣證券交易所)")
+
+# 側邊欄：全域導覽列
+st.sidebar.title("🧭 系統導覽")
+page = st.sidebar.radio("請選擇操作頁面：", ["🔍 策略選股雷達", "⭐ 我的自選股追蹤"])
+st.sidebar.markdown("---")
+
+
+# ==========================================
+# 頁面 1：策略選股雷達
+# ==========================================
+if page == "🔍 策略選股雷達":
+    st.sidebar.header("⚙️ 1. 基本面條件")
+    max_pe = st.sidebar.slider("本益比 (P/E) 最大值", min_value=5.0, max_value=30.0, value=15.0, step=0.5)
+    min_yield = st.sidebar.slider("殖利率 (%) 最小值", min_value=0.0, max_value=15.0, value=4.0, step=0.5)
+    max_pb = st.sidebar.slider("股價淨值比 (P/B) 最大值", min_value=0.5, max_value=5.0, value=1.5, step=0.1)
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("🤖 2. 熱門產業主題")
+    selected_themes = st.sidebar.multiselect("選擇產業類別 (可複選，留空代表全市場)", list(THEME_CONCEPTS.keys()))
+    
+    ignore_fundamentals = False
+    if selected_themes:
+        st.sidebar.info("💡 提示：主題股通常已偏離傳統價值區間。建議勾選下方選項忽略基本面。")
+        ignore_fundamentals = st.sidebar.checkbox("🔓 忽略基本面條件 (直接分析選取標的)", value=True)
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("📈 3. 技術面條件")
+    tech_20ma = st.sidebar.checkbox("股價在月線 (20MA) 之上")
+    tech_5d_high = st.sidebar.checkbox("股價創 5 日新高")
+    tech_macd = st.sidebar.checkbox("MACD 柱狀圖大於 0")
+    tech_rsi = st.sidebar.checkbox("RSI (14) 大於 50")
+
+    col1, col2 = st.columns([1, 1.4])
+
+    with col1:
+        st.subheader("🎯 篩選結果清單")
+        st.info("💡 點擊下方表格任意列，右側可進行【⭐ 加入自選】與詳細分析！")
+        
+        with st.spinner('下載並運算數據中...'):
+            raw_data = get_twse_stock_data()
+            company_profile_df = get_twse_company_profile()
+            
+        selected_stock_id = ""
+        selected_stock_name = ""
+        
+        if raw_data is not None:
+            result_df = clean_and_filter_data(raw_data, max_pe, min_yield, max_pb, ignore_fundamentals)
+            
+            # 主題過濾
+            if result_df is not None and not result_df.empty and selected_themes:
+                target_stocks = []
+                for theme in selected_themes:
+                    target_stocks.extend(THEME_CONCEPTS[theme])
+                result_df = result_df[result_df['代號'].isin(set(target_stocks))]
+                    
+            # 技術面過濾
+            if result_df is not None and not result_df.empty:
+                if any([tech_20ma, tech_5d_high, tech_macd, tech_rsi]):
+                    with st.spinner('分析歷史線圖與指標...'):
+                        result_df = apply_technical_filters(result_df, tech_20ma, tech_5d_high, tech_macd, tech_rsi)
+
+            # 顯示表格
+            if result_df is not None and not result_df.empty:
+                st.success(f"共找到 **{len(result_df)}** 檔股票。")
+                selection_event = st.dataframe(
+                    result_df, use_container_width=True, hide_index=True, height=600,
+                    on_select="rerun", selection_mode="single-row"
+                )
+                if len(selection_event.selection.rows) > 0:
+                    selected_idx = selection_event.selection.rows[0]
+                    selected_stock_id = result_df.iloc[selected_idx]['代號']
+                    selected_stock_name = result_df.iloc[selected_idx]['名稱']
+            else:
+                st.warning("目前沒有符合條件的股票。")
+
+    with col2:
+        st.subheader("📊 個股深度分析")
+        stock_id = st.text_input("輸入股票代號：", value=selected_stock_id, max_chars=10)
+        
+        if stock_id:
+            # --- 收藏自選股按鈕功能 ---
+            btn_col1, btn_col2 = st.columns([1, 2])
+            with btn_col1:
+                if stock_id not in st.session_state['watchlist']:
+                    if st.button(f"⭐ 將 {stock_id} 加入自選", type="primary"):
+                        st.session_state['watchlist'].append(stock_id)
+                        st.rerun()
+                else:
+                    if st.button(f"❌ 將 {stock_id} 移出自選"):
+                        st.session_state['watchlist'].remove(stock_id)
+                        st.rerun()
+            
+            # 顯示封裝好的分析區塊
+            display_stock_analysis(stock_id, selected_stock_name, company_profile_df)
+
+
+# ==========================================
+# 頁面 2：我的自選股追蹤
+# ==========================================
+elif page == "⭐ 我的自選股追蹤":
+    st.subheader("⭐ 我的專屬自選股追蹤庫")
+    
+    if not st.session_state['watchlist']:
+        st.info("📂 您目前尚未收藏任何自選股。請前往左側導覽切換至「🔍 策略選股雷達」，點擊表格並按下「⭐ 加入自選」來建立您的名單！")
+    else:
+        with st.spinner('正在為您的自選股更新今日最新數據...'):
+            raw_data = get_twse_stock_data()
+            company_profile_df = get_twse_company_profile()
+            
+        wl_df = pd.DataFrame()
+        if raw_data is not None:
+            target_columns = {'證券代號': '代號', '證券名稱': '名稱', '本益比': '本益比', '殖利率(%)': '殖利率(%)', '股價淨值比': '股價淨值比'}
+            try:
+                clean_df = raw_data[list(target_columns.keys())].rename(columns=target_columns)
+                for col in ['本益比', '殖利率(%)', '股價淨值比']:
+                    clean_df[col] = clean_df[col].replace('-', '0').str.replace(',', '').astype(float)
+                # 從證交所全市場資料中過濾出我們的自選股
+                wl_df = clean_df[clean_df['代號'].isin(st.session_state['watchlist'])].sort_values(by='代號')
+            except Exception as e:
+                st.error("自選股資料處理發生錯誤")
+                
+        col1, col2 = st.columns([1, 1.4])
+        
+        with col1:
+            st.write(f"目前共追蹤 **{len(st.session_state['watchlist'])}** 檔股票：")
+            if not wl_df.empty:
+                selection_event_wl = st.dataframe(
+                    wl_df, use_container_width=True, hide_index=True, height=600,
+                    on_select="rerun", selection_mode="single-row"
+                )
+                
+                selected_stock_id_wl = ""
+                selected_stock_name_wl = ""
+                if len(selection_event_wl.selection.rows) > 0:
+                    selected_idx = selection_event_wl.selection.rows[0]
+                    selected_stock_id_wl = wl_df.iloc[selected_idx]['代號']
+                    selected_stock_name_wl = wl_df.iloc[selected_idx]['名稱']
+            else:
+                st.warning("無法載入自選股最新報價資料。")
+                
+        with col2:
+            if selected_stock_id_wl:
+                st.subheader(f"📊 {selected_stock_id_wl} 追蹤分析")
+                
+                # 移除自選股按鈕
+                if st.button(f"❌ 從自選庫中刪除 {selected_stock_id_wl}", type="secondary"):
+                    st.session_state['watchlist'].remove(selected_stock_id_wl)
+                    st.rerun()
+                    
+                # 共用畫 K 線與資訊的函數
+                display_stock_analysis(selected_stock_id_wl, selected_stock_name_wl, company_profile_df)
