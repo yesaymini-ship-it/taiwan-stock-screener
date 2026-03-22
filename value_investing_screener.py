@@ -1,10 +1,18 @@
 # ==========================================
-# 版本：v1.1
+# 版本：v1.2
 # 日期：2026-03-22
 # ==========================================
 import streamlit as st
 import requests
 import urllib3
+import pandas as pd
+import yfinance as yf
+import mplfinance as mpf
+from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+import re
+import json
 
 # 統一使用現代瀏覽器的 User-Agent，避免被當成機器人
 CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -216,7 +224,7 @@ def get_stock_history_cached(ticker):
 # ==========================================
 
 st.title("📈 台股全方位選股與深度分析系統")
-st.markdown(f"**系統版本：v1.1 (2026-03-22)** | 資料更新時間：**{datetime.now().strftime('%Y-%m-%d')}** (資料來源：台灣證券交易所)")
+st.markdown(f"**系統版本：v1.2 (2026-03-22)** | 資料更新時間：**{datetime.now().strftime('%Y-%m-%d')}** (資料來源：台灣證券交易所)")
 
 # --- 側邊欄設定 ---
 st.sidebar.header("⚙️ 1. 基本面條件 (尋找好公司)")
