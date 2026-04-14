@@ -1,6 +1,7 @@
 # ==========================================
-# 版本：v1.6
-# 日期：2026-03-22
+# 版本：v1.8
+# 日期：2026-04-14
+# 更新：新增「被動元件」產業主題
 # ==========================================
 import streamlit as st
 import requests
@@ -18,7 +19,6 @@ st.set_page_config(page_title="台股價值選股儀表板", page_icon="📈", l
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- 系統記憶體初始化 (Session State) ---
-# 用來記錄使用者點擊收藏的「自選股清單」
 if 'watchlist' not in st.session_state:
     st.session_state['watchlist'] = []
 
@@ -27,12 +27,19 @@ CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 
 # --- 建立 主題/產業 供應鏈資料庫 ---
 THEME_CONCEPTS = {
-    "矽智財與IC設計 (ASIC)": ['3661', '3443', '3035', '6643'],
+    "👑 世界第一大廠 (長線護城河)": [ # [v1.7 新增] 匯入您的專屬強勢股名單
+        '2330', '3711', '3037', '3443', '3529', 
+        '2337', '2408', '2344', '3260', '2313', 
+        '2367', '2383', '2308', '3017', '3163', 
+        '6442', '3105', '6443'
+    ],
+    "🔋 被動元件 (MLCC/電阻/電感)": ['2327', '2492', '3026', '2478', '6173', '3357', '2472', '3090'],
+    "矽智財與IC設計 (ASIC)": ['3661', '3443', '3035', '6643', '3529'],
     "晶圓代工與先進封裝": ['2330', '3711', '2449'],
     "CoWoS 設備": ['3583', '3131', '6187'],
     "散熱模組 (3D VC/水冷)": ['3017', '3324', '2421', '8996'],
     "銅箔基板 (CCL)": ['2383', '6274', '6213'],
-    "印刷電路板 (PCB)": ['2368', '3037', '3044'],
+    "印刷電路板 (PCB)": ['2368', '3037', '3044', '2313', '2367'],
     "電源供應器": ['2308', '2301', '6412'],
     "伺服器滑軌": ['2059', '6584'],
     "伺服器機殼": ['8210', '6117', '3013'],
@@ -121,7 +128,7 @@ def get_google_news(stock_id, stock_name):
         pass
     return news_list
 
-# --- 數據處理區塊 (基本面 + 技術面) ---
+# --- 數據處理區塊 ---
 def clean_and_filter_data(df, max_pe, min_yield, max_pb, ignore_fundamentals=False):
     if df is None or df.empty: return None
     target_columns = {'證券代號': '代號', '證券名稱': '名稱', '本益比': '本益比', '殖利率(%)': '殖利率(%)', '股價淨值比': '股價淨值比'}
@@ -184,8 +191,6 @@ def apply_technical_filters(df, req_20ma, req_5d_high, req_macd, req_rsi):
                 if latest_close < ma20: pass_all = False
                 
             if pass_all and req_5d_high:
-                # [v1.6 修正]：比較「今日收盤價」與「過去 5 日的最高收盤價」
-                # 解決如果今天留有上影線，就會被判定為沒有創高的錯誤邏輯
                 if latest_close < s_close.iloc[-5:].max(): pass_all = False
                 
             if pass_all and req_macd:
@@ -207,9 +212,7 @@ def get_stock_history_cached(ticker):
     stock = yf.Ticker(ticker)
     return stock.history(period="6mo")
 
-# --- 模組化：個股深度分析區塊 ---
 def display_stock_analysis(stock_id, selected_stock_name, company_profile_df):
-    """將畫 K 線圖與資訊頁籤封裝成函數，讓選股雷達與自選股頁面共用"""
     ticker = f"{stock_id}.TW"
     tab1, tab2, tab3, tab4 = st.tabs(["📈 K線圖", "🏢 核心業務", "📰 近期新聞", "💡 投資建議"])
     global_df = pd.DataFrame() 
@@ -303,22 +306,17 @@ def display_stock_analysis(stock_id, selected_stock_name, company_profile_df):
 # 網頁主架構與導覽
 # ==========================================
 st.title("📈 台股全方位選股與深度分析系統")
-st.markdown(f"**系統版本：v1.6 (2026-03-22)** | 資料更新時間：**{datetime.now().strftime('%Y-%m-%d')}** (資料來源：台灣證券交易所)")
+st.markdown(f"**系統版本：v1.8 (2026-04-14)** | 資料更新時間：**{datetime.now().strftime('%Y-%m-%d')}** (資料來源：台灣證券交易所)")
 
-# 側邊欄：全域導覽列
 st.sidebar.title("🧭 系統導覽")
 page = st.sidebar.radio("請選擇操作頁面：", ["🔍 策略選股雷達", "⭐ 我的自選股追蹤"])
 st.sidebar.markdown("---")
 
-
-# ==========================================
-# 頁面 1：策略選股雷達
-# ==========================================
 if page == "🔍 策略選股雷達":
     st.sidebar.header("⚙️ 1. 基本面條件")
-    max_pe = st.sidebar.slider("本益比 (P/E) 最大值", min_value=5.0, max_value=30.0, value=15.0, step=0.5)
-    min_yield = st.sidebar.slider("殖利率 (%) 最小值", min_value=0.0, max_value=15.0, value=4.0, step=0.5)
-    max_pb = st.sidebar.slider("股價淨值比 (P/B) 最大值", min_value=0.5, max_value=5.0, value=1.5, step=0.1)
+    max_pe = st.sidebar.slider("本益比 (P/E) 最大值", min_value=5.0, max_value=50.0, value=25.0, step=1.0)
+    min_yield = st.sidebar.slider("殖利率 (%) 最小值", min_value=0.0, max_value=15.0, value=2.0, step=0.5)
+    max_pb = st.sidebar.slider("股價淨值比 (P/B) 最大值", min_value=0.5, max_value=10.0, value=3.0, step=0.1)
 
     st.sidebar.markdown("---")
     st.sidebar.header("🤖 2. 熱門產業主題")
@@ -326,7 +324,7 @@ if page == "🔍 策略選股雷達":
     
     ignore_fundamentals = False
     if selected_themes:
-        st.sidebar.info("💡 提示：主題股通常已偏離傳統價值區間。建議勾選下方選項忽略基本面。")
+        st.sidebar.info("💡 提示：『世界第一大廠』或科技龍頭享有較高溢價，建議勾選下方選項忽略傳統本益比限制。")
         ignore_fundamentals = st.sidebar.checkbox("🔓 忽略基本面條件 (直接分析選取標的)", value=True)
 
     st.sidebar.markdown("---")
@@ -340,7 +338,6 @@ if page == "🔍 策略選股雷達":
 
     with col1:
         st.subheader("🎯 篩選結果清單")
-        st.info("💡 點擊下方表格任意列，右側可進行【⭐ 加入自選】與詳細分析！")
         
         with st.spinner('下載並運算數據中...'):
             raw_data = get_twse_stock_data()
@@ -352,20 +349,17 @@ if page == "🔍 策略選股雷達":
         if raw_data is not None:
             result_df = clean_and_filter_data(raw_data, max_pe, min_yield, max_pb, ignore_fundamentals)
             
-            # 主題過濾
             if result_df is not None and not result_df.empty and selected_themes:
                 target_stocks = []
                 for theme in selected_themes:
                     target_stocks.extend(THEME_CONCEPTS[theme])
                 result_df = result_df[result_df['代號'].isin(set(target_stocks))]
                     
-            # 技術面過濾
             if result_df is not None and not result_df.empty:
                 if any([tech_20ma, tech_5d_high, tech_macd, tech_rsi]):
                     with st.spinner('分析歷史線圖與指標...'):
                         result_df = apply_technical_filters(result_df, tech_20ma, tech_5d_high, tech_macd, tech_rsi)
 
-            # 顯示表格
             if result_df is not None and not result_df.empty:
                 st.success(f"共找到 **{len(result_df)}** 檔股票。")
                 selection_event = st.dataframe(
@@ -384,7 +378,6 @@ if page == "🔍 策略選股雷達":
         stock_id = st.text_input("輸入股票代號：", value=selected_stock_id, max_chars=10)
         
         if stock_id:
-            # --- 收藏自選股按鈕功能 ---
             btn_col1, btn_col2 = st.columns([1, 2])
             with btn_col1:
                 if stock_id not in st.session_state['watchlist']:
@@ -395,19 +388,13 @@ if page == "🔍 策略選股雷達":
                     if st.button(f"❌ 將 {stock_id} 移出自選"):
                         st.session_state['watchlist'].remove(stock_id)
                         st.rerun()
-            
-            # 顯示封裝好的分析區塊
             display_stock_analysis(stock_id, selected_stock_name, company_profile_df)
 
-
-# ==========================================
-# 頁面 2：我的自選股追蹤
-# ==========================================
 elif page == "⭐ 我的自選股追蹤":
     st.subheader("⭐ 我的專屬自選股追蹤庫")
     
     if not st.session_state['watchlist']:
-        st.info("📂 您目前尚未收藏任何自選股。請前往左側導覽切換至「🔍 策略選股雷達」，點擊表格並按下「⭐ 加入自選」來建立您的名單！")
+        st.info("📂 您的自選清單目前為空！請前往左側導覽切換至「🔍 策略選股雷達」，在「🤖 2. 熱門產業主題」中選擇「👑 世界第一大廠 (長線護城河)」來挑選標的。")
     else:
         with st.spinner('正在為您的自選股更新今日最新數據...'):
             raw_data = get_twse_stock_data()
@@ -420,10 +407,9 @@ elif page == "⭐ 我的自選股追蹤":
                 clean_df = raw_data[list(target_columns.keys())].rename(columns=target_columns)
                 for col in ['本益比', '殖利率(%)', '股價淨值比']:
                     clean_df[col] = clean_df[col].replace('-', '0').str.replace(',', '').astype(float)
-                # 從證交所全市場資料中過濾出我們的自選股
                 wl_df = clean_df[clean_df['代號'].isin(st.session_state['watchlist'])].sort_values(by='代號')
             except Exception as e:
-                st.error("自選股資料處理發生錯誤")
+                pass
                 
         col1, col2 = st.columns([1, 1.4])
         
@@ -447,11 +433,7 @@ elif page == "⭐ 我的自選股追蹤":
         with col2:
             if selected_stock_id_wl:
                 st.subheader(f"📊 {selected_stock_id_wl} 追蹤分析")
-                
-                # 移除自選股按鈕
                 if st.button(f"❌ 從自選庫中刪除 {selected_stock_id_wl}", type="secondary"):
                     st.session_state['watchlist'].remove(selected_stock_id_wl)
                     st.rerun()
-                    
-                # 共用畫 K 線與資訊的函數
                 display_stock_analysis(selected_stock_id_wl, selected_stock_name_wl, company_profile_df)
